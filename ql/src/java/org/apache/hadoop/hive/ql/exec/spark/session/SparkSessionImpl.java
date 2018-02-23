@@ -54,6 +54,10 @@ public class SparkSessionImpl implements SparkSession {
     sessionId = makeSessionId();
   }
 
+  public SparkSessionImpl(String sessionId) {
+    this.sessionId = sessionId;
+  }
+
   @Override
   public void open(HiveConf conf) throws HiveException {
     this.conf = conf;

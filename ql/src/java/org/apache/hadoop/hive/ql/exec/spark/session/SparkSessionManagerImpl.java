@@ -17,141 +17,180 @@
  */
 package org.apache.hadoop.hive.ql.exec.spark.session;
 
-import java.io.IOException;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Set;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.exec.spark.HiveSparkClientFactory;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hive.spark.client.SparkClientFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Simple implementation of <i>SparkSessionManager</i>
- *   - returns SparkSession when requested through <i>getSession</i> and keeps track of
- *       created sessions. Currently no limit on the number sessions.
- *   - SparkSession is reused if the userName in new conf and user name in session conf match.
- */
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 public class SparkSessionManagerImpl implements SparkSessionManager {
-  private static final Logger LOG = LoggerFactory.getLogger(SparkSessionManagerImpl.class);
+    private static final Logger LOG = LoggerFactory.getLogger(SparkSessionManagerImpl.class);
 
-  private Set<SparkSession> createdSessions = Collections.synchronizedSet(new HashSet<SparkSession>());
-  private volatile boolean inited = false;
+    private final Map<String, SparkSession> createdSessions = new ConcurrentHashMap<>();
+    private volatile boolean inited = false;
 
-  private static SparkSessionManagerImpl instance;
+    private final Map<String, Integer> sessionRefTrack = new ConcurrentHashMap<>();
 
-  static {
-    Runtime.getRuntime().addShutdownHook(new Thread() {
-      @Override
-      public void run() {
-        try {
-          if (instance != null) {
-            instance.shutdown();
-          }
-        } catch (Exception e) {
-          // ignore
-        }
-      }
-    });
-  }
+    private static SparkSessionManagerImpl instance;
 
-  public static synchronized SparkSessionManagerImpl getInstance()
-      throws HiveException {
-    if (instance == null) {
-      instance = new SparkSessionManagerImpl();
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            @Override
+            public void run() {
+                try {
+                    if (instance != null) {
+                        instance.shutdown();
+                    }
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+        });
     }
 
-    return instance;
-  }
+    public static synchronized SparkSessionManagerImpl getInstance()
+            throws HiveException {
+        if (instance == null) {
+            instance = new SparkSessionManagerImpl();
+        }
 
-  private SparkSessionManagerImpl() {
-  }
+        return instance;
+    }
 
-  @Override
-  public void setup(HiveConf hiveConf) throws HiveException {
-    if (!inited) {
-      synchronized (this) {
+    private SparkSessionManagerImpl() {
+
+    }
+
+    @Override
+    public void setup(HiveConf hiveConf) throws HiveException {
         if (!inited) {
-          LOG.info("Setting up the session manager.");
-          Map<String, String> conf = HiveSparkClientFactory.initiateSparkConf(hiveConf);
-          try {
-            SparkClientFactory.initialize(conf);
-            inited = true;
-          } catch (IOException e) {
-            throw new HiveException("Error initializing SparkClientFactory", e);
-          }
+            synchronized (this) {
+                if (!inited) {
+                    LOG.info("Setting up the session manager.");
+                    Map<String, String> conf = HiveSparkClientFactory.initiateSparkConf(hiveConf);
+                    try {
+                        SparkClientFactory.initialize(conf);
+                        inited = true;
+                    } catch (IOException e) {
+                        throw new HiveException("Error initializing SparkClientFactory", e);
+                    }
+                }
+            }
         }
-      }
-    }
-  }
-
-  /**
-   * If the <i>existingSession</i> can be reused return it.
-   * Otherwise
-   *   - close it and remove it from the list.
-   *   - create a new session and add it to the list.
-   */
-  @Override
-  public SparkSession getSession(SparkSession existingSession, HiveConf conf, boolean doOpen)
-      throws HiveException {
-    setup(conf);
-
-    if (existingSession != null) {
-      // Open the session if it is closed.
-      if (!existingSession.isOpen() && doOpen) {
-        existingSession.open(conf);
-      }
-      return existingSession;
     }
 
-    SparkSession sparkSession = new SparkSessionImpl();
-    if (doOpen) {
-      sparkSession.open(conf);
+    private void incrRefTrack(String sessionId) {
+        synchronized (sessionRefTrack) {
+            Integer count;
+            if (sessionRefTrack.containsKey(sessionId)) {
+                count = sessionRefTrack.get(sessionId);
+            } else {
+                count = 0;
+            }
+            sessionRefTrack.put(sessionId, count + 1);
+        }
     }
 
-    if (LOG.isDebugEnabled()) {
-      LOG.debug(String.format("New session (%s) is created.", sparkSession.getSessionId()));
-    }
-    createdSessions.add(sparkSession);
-    return sparkSession;
-  }
-
-  @Override
-  public void returnSession(SparkSession sparkSession) throws HiveException {
-    // In this particular SparkSessionManager implementation, we don't recycle
-    // returned sessions. References to session are still valid.
-  }
-
-  @Override
-  public void closeSession(SparkSession sparkSession) throws HiveException {
-    if (sparkSession == null) {
-      return;
+    private void decrRefTrack(String sessionId) {
+        synchronized (sessionRefTrack) {
+            Integer count = sessionRefTrack.get(sessionId) - 1;
+            if (count == 0) {
+                sessionRefTrack.remove(sessionId);
+            } else {
+                sessionRefTrack.put(sessionId, count);
+            }
+        }
     }
 
-    if (LOG.isDebugEnabled()) {
-      LOG.debug(String.format("Closing session (%s).", sparkSession.getSessionId()));
-    }
-    sparkSession.close();
-    createdSessions.remove(sparkSession);
-  }
+    /**
+     * If the <i>existingSession</i> can be reused return it.
+     * Otherwise
+     *   - close it and remove it from the list.
+     *   - create a new session and add it to the list.
+     */
+    @Override
+    public SparkSession getSession(SparkSession existingSession, HiveConf conf, boolean doOpen)
+            throws HiveException {
+        setup(conf);
 
-  @Override
-  public void shutdown() {
-    LOG.info("Closing the session manager.");
-    synchronized (createdSessions) {
-      Iterator<SparkSession> it = createdSessions.iterator();
-      while (it.hasNext()) {
-        SparkSession session = it.next();
-        session.close();
-      }
-      createdSessions.clear();
+        String sessionId = conf.getVar(HiveConf.ConfVars.HIVESESSIONID);
+        if (!sessionId.equals("")) {
+            existingSession = createdSessions.get(sessionId);
+        }
+
+        if (existingSession != null) {
+            incrRefTrack(existingSession.getSessionId());
+            // Open the session if it is closed.
+            if (!existingSession.isOpen() && doOpen) {
+                existingSession.open(conf);
+            }
+            return existingSession;
+        }
+
+        SparkSession sparkSession;
+        if (!sessionId.equals("")) {
+            sparkSession = new SparkSessionImpl(sessionId);
+        } else {
+            sparkSession = new SparkSessionImpl();
+        }
+
+        if (doOpen) {
+            sparkSession.open(conf);
+        }
+
+        incrRefTrack(sparkSession.getSessionId());
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(String.format("New session (%s) is created.", sparkSession.getSessionId()));
+        }
+        createdSessions.put(sparkSession.getSessionId(), sparkSession);
+        return sparkSession;
     }
-    inited = false;
-    SparkClientFactory.stop();
-  }
+
+    @Override
+    public void returnSession(SparkSession sparkSession) throws HiveException {
+        if (sparkSession == null) {
+            return;
+        }
+        decrRefTrack(sparkSession.getSessionId());
+    }
+
+    @Override
+    public void closeSession(SparkSession sparkSession) throws HiveException {
+        // Use reference track to manage session. Only when no one is using the
+        // session, it's allowed to be closed
+        String sessionId = sparkSession.getSessionId();
+        if (!sessionRefTrack.containsKey(sessionId)) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(String.format("Closing session (%s).", sessionId));
+            }
+            synchronized (createdSessions) {
+                createdSessions.get(sessionId).close();
+                createdSessions.remove(sessionId);
+            }
+        }
+        // do nothing to a running session
+    }
+
+    @Override
+    public void shutdown() {
+        LOG.info("Closing the session manager.");
+        synchronized (createdSessions) {
+            Iterator<SparkSession> it = createdSessions.values().iterator();
+            while (it.hasNext()) {
+                SparkSession session = it.next();
+                session.close();
+            }
+            createdSessions.clear();
+        }
+        sessionRefTrack.clear();
+        inited = false;
+        SparkClientFactory.stop();
+    }
 }
